@@ -213,17 +213,40 @@ export const syncService = {
       const serverNotes = await api.fetchNotes();
       const localNotes = await notesDB.getAll();
 
-      // Create maps for efficient lookup
+      // Create a map of server note IDs for efficient lookup
       const serverNotesMap = new Map(serverNotes.map(n => [n.id, n]));
-      const localNotesMap = new Map(localNotes.map(n => [n.id || n.localId, n]));
+
+      // Create a map of local notes by server ID (only for notes that have been synced)
+      const localNotesByServerId = new Map<string, LocalNote>();
+      for (const localNote of localNotes) {
+        if (localNote.id) {
+          localNotesByServerId.set(localNote.id, localNote);
+        }
+      }
 
       // Process server notes
       for (const serverNote of serverNotes) {
-        const localNote = localNotes.find(n => n.id === serverNote.id);
+        const localNote = localNotesByServerId.get(serverNote.id);
 
         if (!localNote) {
-          // New note from server
-          await notesDB.put(serverToLocalNote(serverNote));
+          // New note from server - check it's not a duplicate of a pending local note
+          // by comparing title, content, and similar timestamps
+          const possibleDuplicate = localNotes.find(ln =>
+            !ln.id && // Only check notes without server ID (pending creates)
+            ln.title === serverNote.title &&
+            ln.content === serverNote.content
+          );
+
+          if (possibleDuplicate) {
+            // This is likely our note that was synced - update it with server data
+            await notesDB.put({
+              ...serverToLocalNote(serverNote),
+              localId: possibleDuplicate.localId, // Keep the original localId
+            });
+          } else {
+            // Truly new note from server (created on another device)
+            await notesDB.put(serverToLocalNote(serverNote));
+          }
           result.synced++;
         } else if (localNote.syncStatus === 'synced') {
           // Update local with server version
@@ -234,9 +257,9 @@ export const syncService = {
           result.synced++;
         } else {
           // Conflict resolution - last write wins based on modified_at
-          const conflict = this.resolveConflict(localNote, serverNote);
-          await notesDB.put(conflict);
-          if (conflict.syncStatus === 'conflict') {
+          const resolved = this.resolveConflict(localNote, serverNote);
+          await notesDB.put(resolved);
+          if (resolved.syncStatus === 'conflict') {
             result.conflicts++;
           } else {
             result.synced++;
@@ -245,6 +268,7 @@ export const syncService = {
       }
 
       // Check for local notes that don't exist on server (deleted remotely)
+      // Only remove synced notes - pending notes haven't been created on server yet
       for (const localNote of localNotes) {
         if (localNote.id && !serverNotesMap.has(localNote.id) && localNote.syncStatus === 'synced') {
           // Note was deleted on server
@@ -293,7 +317,31 @@ export const syncService = {
     let synced = 0;
     let failed = 0;
 
-    for (const operation of pendingOps) {
+    // Deduplicate operations - keep only the latest operation per localId
+    const latestOps = new Map<string, PendingOperation>();
+    for (const op of pendingOps) {
+      const existing = latestOps.get(op.localId);
+      // If delete operation exists, it takes precedence
+      if (op.type === 'delete') {
+        latestOps.set(op.localId, op);
+      } else if (!existing || new Date(op.timestamp) > new Date(existing.timestamp)) {
+        // Keep the latest non-delete operation
+        if (existing?.type !== 'delete') {
+          latestOps.set(op.localId, op);
+        }
+      }
+    }
+
+    // Remove duplicate operations from the database
+    for (const op of pendingOps) {
+      const latest = latestOps.get(op.localId);
+      if (latest && op.id !== latest.id) {
+        await pendingOpsDB.remove(op.id);
+      }
+    }
+
+    // Process deduplicated operations
+    for (const operation of latestOps.values()) {
       try {
         await this.processOperation(operation);
         await pendingOpsDB.remove(operation.id);
@@ -325,6 +373,23 @@ export const syncService = {
   async processOperation(operation: PendingOperation): Promise<void> {
     switch (operation.type) {
       case 'create': {
+        // First check if the local note still exists and doesn't already have a server ID
+        const localNote = await notesDB.getByLocalId(operation.localId);
+
+        // Skip if note was deleted locally or already has a server ID
+        if (!localNote) {
+          return;
+        }
+
+        if (localNote.id) {
+          // Note already has server ID - just mark as synced
+          await notesDB.put({
+            ...localNote,
+            syncStatus: 'synced',
+          });
+          return;
+        }
+
         const serverNote = await api.createNote({
           user_id: operation.data.user_id as string,
           title: operation.data.title as string,
@@ -333,15 +398,12 @@ export const syncService = {
         });
 
         // Update local note with server ID
-        const localNote = await notesDB.getByLocalId(operation.localId);
-        if (localNote) {
-          await notesDB.put({
-            ...localNote,
-            id: serverNote.id,
-            created_at: serverNote.created_at,
-            syncStatus: 'synced',
-          });
-        }
+        await notesDB.put({
+          ...localNote,
+          id: serverNote.id,
+          created_at: serverNote.created_at,
+          syncStatus: 'synced',
+        });
         break;
       }
 
